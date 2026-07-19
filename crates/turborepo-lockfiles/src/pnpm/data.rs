@@ -234,6 +234,12 @@ pub struct PackageResolution {
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit: Option<String>,
+    // Passthrough for resolution shapes we don't model, e.g. the `variants`
+    // list of `type: variations` resolutions that pnpm 10.14+ writes for
+    // devEngines runtime packages (`node@runtime:<version>`). Dropping these
+    // fields on re-serialization would corrupt the pruned lockfile.
+    #[serde(flatten)]
+    other: Map<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

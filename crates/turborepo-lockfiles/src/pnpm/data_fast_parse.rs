@@ -761,6 +761,7 @@ fn parse_resolution(events: &mut Events) -> FResult<PackageResolution> {
     let mut directory = None;
     let mut repo = None;
     let mut commit = None;
+    let mut other = Map::new();
     while !events.at_mapping_end()? {
         let key = events.string()?;
         match key.as_str() {
@@ -770,7 +771,12 @@ fn parse_resolution(events: &mut Events) -> FResult<PackageResolution> {
             "directory" => set_once(&mut directory, events.string()?)?,
             "repo" => set_once(&mut repo, events.string()?)?,
             "commit" => set_once(&mut commit, events.string()?)?,
-            _ => events.skip_node()?,
+            _ => {
+                let value = parse_value(events)?;
+                if other.insert(key, value).is_some() {
+                    return Err(Unsupported::here());
+                }
+            }
         }
     }
     Ok(PackageResolution {
@@ -780,6 +786,7 @@ fn parse_resolution(events: &mut Events) -> FResult<PackageResolution> {
         directory,
         repo,
         commit,
+        other,
     })
 }
 
@@ -1456,7 +1463,7 @@ time:
     }
 
     #[test]
-    fn test_unknown_fields_are_ignored_like_serde() {
+    fn test_unknown_fields_are_preserved_like_serde() {
         assert_fast_matches_serde(
             r#"lockfileVersion: '9.0'
 someFutureRootField:
