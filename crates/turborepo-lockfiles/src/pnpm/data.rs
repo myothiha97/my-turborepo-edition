@@ -234,6 +234,12 @@ pub struct PackageResolution {
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit: Option<String>,
+    // Passthrough for resolution shapes we don't model, e.g. the `variants`
+    // list of `type: variations` resolutions that pnpm 10.14+ writes for
+    // devEngines runtime packages (`node@runtime:<version>`). Dropping these
+    // fields on re-serialization would corrupt the pruned lockfile.
+    #[serde(flatten)]
+    other: Map<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -832,6 +838,26 @@ impl crate::Lockfile for PnpmLockfile {
 
                     let key = self.format_key(dependency, version);
                     self.retain_package(&key, &mut pruned_packages, &mut pruned_snapshots)?;
+                }
+            } else {
+                // pnpm 10.14+ records a devEngines runtime with
+                // `onFail: "download"` as a synthetic importer dependency
+                // using the `runtime:` protocol (e.g. `node@runtime:22.0.0`).
+                // It exists only in the lockfile — never in package.json — so
+                // the caller's package closure can't include it. Follow root
+                // importer runtime deps here so the pruned lockfile keeps
+                // their packages/snapshots entries. (Workspace importers are
+                // fully walked above.)
+                for dependency in importer.dependencies.all_dependency_names() {
+                    let Some((_, version)) = importer.dependencies.find_resolution(dependency)
+                    else {
+                        continue;
+                    };
+
+                    if version.starts_with("runtime:") {
+                        let key = self.format_key(dependency, version);
+                        self.retain_package(&key, &mut pruned_packages, &mut pruned_snapshots)?;
+                    }
                 }
             }
 
@@ -2975,5 +3001,156 @@ snapshots:
 
         // Root importer should still be present.
         assert!(pruned_lockfile.importers.contains_key("."));
+    }
+
+    #[test]
+    fn test_subgraph_keeps_root_runtime_dependency() {
+        // pnpm 10.14+ with devEngines.runtime `onFail: "download"` records the
+        // runtime as a synthetic root importer dependency plus
+        // `node@runtime:<version>` packages/snapshots entries. Pruning must
+        // keep all three consistent — and preserve the `variants` list of the
+        // `type: variations` resolution — or `pnpm install --frozen-lockfile`
+        // fails on the pruned output.
+        let yaml = r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      node:
+        specifier: runtime:22.0.0
+        version: runtime:22.0.0
+
+  apps/web:
+    dependencies:
+      is-odd:
+        specifier: 3.0.1
+        version: 3.0.1
+
+packages:
+
+  is-number@6.0.0:
+    resolution: {integrity: sha512-abc}
+
+  is-odd@3.0.1:
+    resolution: {integrity: sha512-def}
+
+  node@runtime:22.0.0:
+    resolution:
+      type: variations
+      variants:
+        - resolution:
+            archive: tarball
+            bin:
+              node: bin/node
+            integrity: sha256-6pbTSc+qZ6qHzuqj5bUskWf3rDAv2NH/Fi0HhencB4U=
+            type: binary
+            url: https://nodejs.org/download/release/v22.0.0/node-v22.0.0-darwin-arm64.tar.gz
+          targets:
+            - cpu: arm64
+              os: darwin
+        - resolution:
+            archive: tarball
+            bin:
+              node: bin/node
+            integrity: sha256-B5uKirjPfhWlPHXOvyItOD5u7NfUIkSZKAB2GMjfEnE=
+            type: binary
+            url: https://nodejs.org/download/release/v22.0.0/node-v22.0.0-linux-x64.tar.gz
+          targets:
+            - cpu: x64
+              os: linux
+    version: 22.0.0
+
+snapshots:
+
+  is-number@6.0.0: {}
+
+  is-odd@3.0.1:
+    dependencies:
+      is-number: 6.0.0
+
+  node@runtime:22.0.0: {}
+"#;
+        let lockfile = PnpmLockfile::from_bytes(yaml.as_bytes()).unwrap();
+
+        let pruned = lockfile
+            .subgraph(
+                &["apps/web".to_string()],
+                &["is-number@6.0.0".to_string(), "is-odd@3.0.1".to_string()],
+            )
+            .unwrap();
+
+        let pruned_bytes = pruned.encode().unwrap();
+        let pruned_lockfile = PnpmLockfile::from_bytes(&pruned_bytes).unwrap();
+
+        // The root importer keeps its `node: runtime:22.0.0` reference, so
+        // the packages/snapshots entries it points at must survive the prune.
+        let packages = pruned_lockfile.packages.as_ref().unwrap();
+        let snapshots = pruned_lockfile.snapshots.as_ref().unwrap();
+        assert!(
+            packages.contains_key("node@runtime:22.0.0"),
+            "pruned lockfile must keep the runtime packages entry"
+        );
+        assert!(
+            snapshots.contains_key("node@runtime:22.0.0"),
+            "pruned lockfile must keep the runtime snapshots entry"
+        );
+
+        // The `variants` list must round-trip intact.
+        let resolution = &packages.get("node@runtime:22.0.0").unwrap().resolution;
+        assert_eq!(resolution.type_field.as_deref(), Some("variations"));
+        let variants = resolution
+            .other
+            .get("variants")
+            .expect("variations resolution must keep its variants list");
+        assert_eq!(variants.as_sequence().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn test_runtime_resolution_survives_reencode() {
+        // Even when the runtime entry is kept, re-serialization must not
+        // strip the unmodeled resolution fields.
+        let yaml = r#"lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    devDependencies:
+      node:
+        specifier: runtime:22.0.0
+        version: runtime:22.0.0
+
+packages:
+
+  node@runtime:22.0.0:
+    resolution:
+      type: variations
+      variants:
+        - resolution:
+            archive: tarball
+            bin:
+              node: bin/node
+            integrity: sha256-6pbTSc+qZ6qHzuqj5bUskWf3rDAv2NH/Fi0HhencB4U=
+            type: binary
+            url: https://nodejs.org/download/release/v22.0.0/node-v22.0.0-darwin-arm64.tar.gz
+          targets:
+            - cpu: arm64
+              os: darwin
+    version: 22.0.0
+
+snapshots:
+
+  node@runtime:22.0.0: {}
+"#;
+        let lockfile = PnpmLockfile::from_bytes(yaml.as_bytes()).unwrap();
+        let reencoded = PnpmLockfile::from_bytes(&lockfile.encode().unwrap()).unwrap();
+        assert_eq!(
+            lockfile.packages, reencoded.packages,
+            "packages must survive an encode/parse round-trip"
+        );
     }
 }
