@@ -839,6 +839,26 @@ impl crate::Lockfile for PnpmLockfile {
                     let key = self.format_key(dependency, version);
                     self.retain_package(&key, &mut pruned_packages, &mut pruned_snapshots)?;
                 }
+            } else {
+                // pnpm 10.14+ records a devEngines runtime with
+                // `onFail: "download"` as a synthetic importer dependency
+                // using the `runtime:` protocol (e.g. `node@runtime:22.0.0`).
+                // It exists only in the lockfile — never in package.json — so
+                // the caller's package closure can't include it. Follow root
+                // importer runtime deps here so the pruned lockfile keeps
+                // their packages/snapshots entries. (Workspace importers are
+                // fully walked above.)
+                for dependency in importer.dependencies.all_dependency_names() {
+                    let Some((_, version)) = importer.dependencies.find_resolution(dependency)
+                    else {
+                        continue;
+                    };
+
+                    if version.starts_with("runtime:") {
+                        let key = self.format_key(dependency, version);
+                        self.retain_package(&key, &mut pruned_packages, &mut pruned_snapshots)?;
+                    }
+                }
             }
 
             let injected_deps: Vec<_> = importer
